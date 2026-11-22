@@ -68,6 +68,75 @@ void syzygy_extend_pv(const OptionsMap&            options,
 
 using namespace Search;
 
+// "Gotham style" bias: small bonus for sharp, attacking moves, used only to
+// choose between root moves that are already close in score.
+static int style_bonus(const Position& pos, Move m) {
+    const Color us    = pos.side_to_move();
+    const Piece moved = pos.moved_piece(m);
+    int         bonus = 0;
+
+    // Checks keep the initiative
+    if (pos.gives_check(m))
+        bonus += PawnValue / 8;
+
+    if (type_of(moved) == KING)
+        return bonus;
+
+    // Sacrifices and gambits: the move loses material by static exchange,
+    // yet the engine still rates it close to the best move
+    if (!pos.see_ge(m, 0))
+        bonus += PawnValue / 6;
+
+    // Pressure on the enemy king: landing within two squares of it
+    const Square ksq = pos.square<KING>(~us);
+    const Square to  = m.to_sq();
+    const int    df  = std::abs(int(file_of(to)) - int(file_of(ksq)));
+    const int    dr  = std::abs(int(rank_of(to)) - int(rank_of(ksq)));
+    if (std::max(df, dr) <= 2)
+        bonus += PawnValue / 16;
+
+    return bonus;
+}
+
+// Same selection rule as Skill::pick_best, plus the style bonus.
+static Move styled_pick(Skill&           skill,
+                        const RootMoves& rootMoves,
+                        usize            multiPV,
+                        const Position&  pos) {
+    static PRNG rng(now());
+
+    Value topScore = rootMoves[0].score;
+    Value minScore = rootMoves[0].score;
+    for (usize i = 1; i < multiPV; ++i)
+    {
+        topScore = std::max(topScore, rootMoves[i].score);
+        minScore = std::min(minScore, rootMoves[i].score);
+    }
+    int    delta    = std::min(topScore - minScore, int(PawnValue));
+    int    maxScore = -VALUE_INFINITE;
+    double weakness = 120 - 2 * skill.level;
+
+    for (usize i = 0; i < multiPV; ++i)
+    {
+        int push = int(weakness * int(topScore - rootMoves[i].score)
+                       + delta * (rng.rand<unsigned>() % int(weakness)))
+                 / 128;
+
+        // Only moves within 3/4 of a pawn of the best one get the bonus
+        int styleBonus = 0;
+        if (topScore - rootMoves[i].score <= 3 * PawnValue / 4)
+            styleBonus = style_bonus(pos, rootMoves[i].pv[0]);
+
+        if (rootMoves[i].score + push + styleBonus >= maxScore)
+        {
+            maxScore   = rootMoves[i].score + push + styleBonus;
+            skill.best = rootMoves[i].pv[0];
+        }
+    }
+
+    return skill.best;
+}
+
 namespace {
 
 constexpr u64 NODES_LIMIT_OUTPUT = 10'000'000;
@@ -323,7 +392,7 @@ bool Search::Worker::iterative_deepening() {
     // When playing with strength handicap enable MultiPV search that we will
     // use behind-the-scenes to retrieve a set of possible moves.
     if (skill.enabled())
-        multiPV = std::max(multiPV, usize(4));
+        multiPV = std::max(multiPV, usize(5));
 
     multiPV = std::min(multiPV, rootMoves.size());
 
@@ -572,7 +641,7 @@ bool Search::Worker::iterative_deepening() {
 
         // If the skill level is enabled and time is up, pick a sub-optimal best move
         if (skill.enabled() && skill.time_to_pick(rootDepth))
-            skill.pick_best(rootMoves, multiPV);
+            styled_pick(skill, rootMoves, multiPV, rootPos);
 
         // Do we have time for the next iteration? Can we stop searching now?
         if (limits.use_time_management() && !threads.stop && !mainThread->stopOnPonderhit)
@@ -643,7 +712,7 @@ bool Search::Worker::iterative_deepening() {
     // If the skill level is enabled, swap the best PV line with the sub-optimal one
     if (skill.enabled())
     {
-        Move pick = skill.best ? skill.best : skill.pick_best(rootMoves, multiPV);
+        Move pick = skill.best ? skill.best : styled_pick(skill, rootMoves, multiPV, rootPos);
         if (pick != rootMoves[0].pv[0])
         {
             const auto bestScore = rootMoves[0].score;
