@@ -1,0 +1,19 @@
+name: Build Windows
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make curl
+      - shell: msys2 {0}
+        run: |
+          cd src
+          make -j build ARCH=x86-64-avx2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stockfish-windows
+          path: src/stockfish.exe
