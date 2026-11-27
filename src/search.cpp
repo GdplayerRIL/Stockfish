@@ -68,6 +68,16 @@ void syzygy_extend_pv(const OptionsMap&            options,
 
 using namespace Search;
 
+// ---- Gotham style tunables (edit these numbers and rebuild) ----
+// Search depth cap used whenever the strength handicap is on.
+static constexpr int GothamMaxDepth = 13;
+// Percent of moves on which it deliberately misses the best move.
+// Style strength (Firouzja blitz profile): bigger bonuses = more dynamic play.
+static constexpr int GothamOversightPct = 3;
+// An oversight move must be between 1/3 and 3/2 of a pawn worse than the best.
+static constexpr int GothamOversightMin = PawnValue / 3;
+static constexpr int GothamOversightMax = 3 * PawnValue / 2;
+
 // "Gotham style" bias: small bonus for sharp, attacking moves, used only to
 // choose between root moves that are already close in score.
 static int style_bonus(const Position& pos, Move m) {
@@ -77,7 +87,7 @@ static int style_bonus(const Position& pos, Move m) {
 
     // Checks keep the initiative
     if (pos.gives_check(m))
-        bonus += PawnValue / 8;
+        bonus += PawnValue / 6;
 
     if (type_of(moved) == KING)
         return bonus;
@@ -85,7 +95,7 @@ static int style_bonus(const Position& pos, Move m) {
     // Sacrifices and gambits: the move loses material by static exchange,
     // yet the engine still rates it close to the best move
     if (!pos.see_ge(m, 0))
-        bonus += PawnValue / 6;
+        bonus += PawnValue / 4;
 
     // Pressure on the enemy king: landing within two squares of it
     const Square ksq = pos.square<KING>(~us);
@@ -93,7 +103,7 @@ static int style_bonus(const Position& pos, Move m) {
     const int    df  = std::abs(int(file_of(to)) - int(file_of(ksq)));
     const int    dr  = std::abs(int(rank_of(to)) - int(rank_of(ksq)));
     if (std::max(df, dr) <= 2)
-        bonus += PawnValue / 16;
+        bonus += PawnValue / 10;
 
     return bonus;
 }
@@ -122,9 +132,9 @@ static Move styled_pick(Skill&           skill,
                        + delta * (rng.rand<unsigned>() % int(weakness)))
                  / 128;
 
-        // Only moves within 3/4 of a pawn of the best one get the bonus
+        // Only moves within 4/5 of a pawn of the best one get the bonus
         int styleBonus = 0;
-        if (topScore - rootMoves[i].score <= 3 * PawnValue / 4)
+        if (topScore - rootMoves[i].score <= 4 * PawnValue / 5)
             styleBonus = style_bonus(pos, rootMoves[i].pv[0]);
 
         if (rootMoves[i].score + push + styleBonus >= maxScore)
@@ -132,6 +142,23 @@ static Move styled_pick(Skill&           skill,
             maxScore   = rootMoves[i].score + push + styleBonus;
             skill.best = rootMoves[i].pv[0];
         }
+    }
+
+    // Occasional oversight: sometimes play a clearly worse (but not terrible)
+    // move instead, like a human missing something
+    if (multiPV > 1 && !is_decisive(topScore)
+        && int(rng.rand<unsigned>() % 100) < GothamOversightPct)
+    {
+        usize idx[16];
+        usize n = 0;
+        for (usize i = 0; i < multiPV && n < 16; ++i)
+        {
+            int diff = int(topScore - rootMoves[i].score);
+            if (diff >= GothamOversightMin && diff <= GothamOversightMax)
+                idx[n++] = i;
+        }
+        if (n)
+            skill.best = rootMoves[idx[rng.rand<unsigned>() % n]].pv[0];
     }
 
     return skill.best;
@@ -392,7 +419,7 @@ bool Search::Worker::iterative_deepening() {
     // When playing with strength handicap enable MultiPV search that we will
     // use behind-the-scenes to retrieve a set of possible moves.
     if (skill.enabled())
-        multiPV = std::max(multiPV, usize(5));
+        multiPV = std::max(multiPV, usize(6));
 
     multiPV = std::min(multiPV, rootMoves.size());
 
@@ -642,6 +669,10 @@ bool Search::Worker::iterative_deepening() {
         // If the skill level is enabled and time is up, pick a sub-optimal best move
         if (skill.enabled() && skill.time_to_pick(rootDepth))
             styled_pick(skill, rootMoves, multiPV, rootPos);
+
+        // Gotham style: shallow search cap while the handicap is on
+        if (skill.enabled() && rootDepth >= GothamMaxDepth)
+            threads.stop = true;
 
         // Do we have time for the next iteration? Can we stop searching now?
         if (limits.use_time_management() && !threads.stop && !mainThread->stopOnPonderhit)
